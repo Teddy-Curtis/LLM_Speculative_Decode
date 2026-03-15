@@ -18,6 +18,7 @@ def add_sampling_args(parser: argparse.ArgumentParser) -> None:
     """Add the shared sampling flags used by all CLI entry points."""
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
+    parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
 
 
@@ -97,6 +98,28 @@ def probs_from_logits(
 def sample_from_probs(probs: torch.Tensor) -> torch.Tensor:
     """Sample one token ID from a probability distribution."""
     return torch.multinomial(probs, num_samples=1)
+
+
+def select_next_token(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    greedy: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert logits into both a probability distribution and a chosen next token.
+
+    In sampling mode we apply temperature/top-k and sample from the resulting
+    distribution. In greedy mode we still materialize the probability
+    distribution for acceptance-ratio calculations, but we choose the argmax
+    token deterministically.
+    """
+    probs = probs_from_logits(logits, temperature, top_k)
+    if greedy:
+        token = torch.argmax(probs, dim=-1, keepdim=True)
+    else:
+        token = sample_from_probs(probs)
+    return probs, token
 
 
 def synchronize_if_needed(device: torch.device) -> None:

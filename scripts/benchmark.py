@@ -26,7 +26,7 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def run_baseline(model, input_ids, max_new_tokens, temperature, top_k, device):
+def run_baseline(model, input_ids, max_new_tokens, temperature, top_k, device, greedy):
     """Run one baseline decode and return metrics in a JSON-friendly dict."""
     start = timed_call_start(device)
     generated = autoregressive_generate(
@@ -35,6 +35,7 @@ def run_baseline(model, input_ids, max_new_tokens, temperature, top_k, device):
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
+        greedy=greedy,
     )
     latency = timed_call_end(device, start)
     new_tokens = generated.shape[1] - input_ids.shape[1]
@@ -54,6 +55,7 @@ def run_speculative(
     temperature,
     top_k,
     device,
+    greedy,
 ):
     """Run one speculative decode and return metrics in a JSON-friendly dict."""
     start = timed_call_start(device)
@@ -65,6 +67,7 @@ def run_speculative(
         num_draft_tokens=num_draft_tokens,
         temperature=temperature,
         top_k=top_k,
+        greedy=greedy,
     )
     latency = timed_call_end(device, start)
     return {
@@ -82,6 +85,14 @@ def summarize(results: List[Dict[str, float]], key: str) -> float:
     return statistics.mean(result[key] for result in results)
 
 
+def average_result_dicts(results: List[Dict[str, float]]) -> Dict[str, float]:
+    """Average each numeric field across repeated runs of the same prompt."""
+    return {
+        key: statistics.mean(result[key] for result in results)
+        for key in results[0]
+    }
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Benchmark baseline vs speculative decoding.")
     parser.add_argument("--draft-model", default=DEFAULT_DRAFT_MODEL)
@@ -91,6 +102,8 @@ def build_parser():
     parser.add_argument("--device", default=None)
     parser.add_argument("--prompt", action="append", dest="prompts")
     parser.add_argument("--output", default=None)
+    parser.add_argument("--warmup-runs", type=int, default=1)
+    parser.add_argument("--benchmark-repeats", type=int, default=3)
     add_sampling_args(parser)
     return parser
 
@@ -112,7 +125,7 @@ def main():
         # Each prompt is benchmarked independently so we can average across a
         # small fixed prompt set rather than overfitting to one lucky example.
         input_ids = encode_prompt(tokenizer, prompt, device)
-        baseline_results.append(
+        for _ in range(args.warmup_runs):
             run_baseline(
                 model=target_model,
                 input_ids=input_ids,
@@ -120,9 +133,8 @@ def main():
                 temperature=args.temperature,
                 top_k=args.top_k,
                 device=device,
+                greedy=args.greedy,
             )
-        )
-        speculative_results.append(
             run_speculative(
                 draft_model=draft_model,
                 target_model=target_model,
@@ -132,8 +144,39 @@ def main():
                 temperature=args.temperature,
                 top_k=args.top_k,
                 device=device,
+                greedy=args.greedy,
             )
-        )
+
+        prompt_baseline_runs = []
+        prompt_speculative_runs = []
+        for _ in range(args.benchmark_repeats):
+            prompt_baseline_runs.append(
+                run_baseline(
+                    model=target_model,
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    device=device,
+                    greedy=args.greedy,
+                )
+            )
+            prompt_speculative_runs.append(
+                run_speculative(
+                    draft_model=draft_model,
+                    target_model=target_model,
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    num_draft_tokens=args.num_draft_tokens,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    device=device,
+                    greedy=args.greedy,
+                )
+            )
+
+        baseline_results.append(average_result_dicts(prompt_baseline_runs))
+        speculative_results.append(average_result_dicts(prompt_speculative_runs))
 
     baseline_tps = summarize(baseline_results, "tokens_per_second")
     speculative_tps = summarize(speculative_results, "tokens_per_second")
@@ -151,6 +194,9 @@ def main():
         "draft_block_size": args.num_draft_tokens,
         "temperature": args.temperature,
         "top_k": args.top_k,
+        "greedy": args.greedy,
+        "warmup_runs": args.warmup_runs,
+        "benchmark_repeats": args.benchmark_repeats,
         "prompts": prompts,
         "baseline": baseline_results,
         "speculative": speculative_results,
@@ -172,6 +218,9 @@ def main():
     print(f"num_prompts={len(prompts)}")
     print(f"max_new_tokens={args.max_new_tokens}")
     print(f"draft_block_size={args.num_draft_tokens}")
+    print(f"greedy={args.greedy}")
+    print(f"warmup_runs={args.warmup_runs}")
+    print(f"benchmark_repeats={args.benchmark_repeats}")
     print()
     print("baseline:")
     print(f"  avg_tokens_per_second={baseline_tps:.4f}")

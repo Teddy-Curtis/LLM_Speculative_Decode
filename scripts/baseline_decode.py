@@ -10,9 +10,8 @@ from common import (
     load_model,
     load_tokenizer,
     prime_model_cache,
-    probs_from_logits,
     resolve_device,
-    sample_from_probs,
+    select_next_token,
     set_seed,
     timed_call_end,
     timed_call_start,
@@ -26,6 +25,7 @@ def autoregressive_generate(
     max_new_tokens: int,
     temperature: float,
     top_k: int,
+    greedy: bool,
 ):
     """
     Standard left-to-right decoding using one model and its KV cache.
@@ -43,8 +43,7 @@ def autoregressive_generate(
 
     for _ in range(max_new_tokens):
         # `logits` always represents "what should come next after the current prefix".
-        next_token_probs = probs_from_logits(logits, temperature, top_k)
-        next_token = sample_from_probs(next_token_probs)
+        _, next_token = select_next_token(logits, temperature, top_k, greedy)
         generated = torch.cat([generated, next_token], dim=1)
         logits, past_key_values = advance_model_cache(model, next_token, past_key_values)
 
@@ -78,6 +77,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        greedy=args.greedy,
     )
     latency = timed_call_end(device, start)
 

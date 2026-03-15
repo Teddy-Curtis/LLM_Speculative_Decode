@@ -13,7 +13,7 @@ from common import (
     prime_model_cache,
     probs_from_logits,
     resolve_device,
-    sample_from_probs,
+    select_next_token,
     set_seed,
     timed_call_end,
     timed_call_start,
@@ -29,6 +29,7 @@ def generate_draft_tokens(
     num_draft_tokens: int,
     temperature: float,
     top_k: int,
+    greedy: bool,
 ):
     """
     Ask the draft model to propose a short block of future tokens.
@@ -53,8 +54,7 @@ def generate_draft_tokens(
 
     for _ in range(num_draft_tokens):
         # Sample from the draft model's current next-token distribution.
-        probs = probs_from_logits(logits, temperature, top_k)
-        token = sample_from_probs(probs)
+        probs, token = select_next_token(logits, temperature, top_k, greedy)
         proposal_tokens.append(token)
         proposal_probs.append(probs)
         # Roll the draft cache forward so the next loop iteration sees a longer prefix.
@@ -97,6 +97,7 @@ def speculative_generate(
     num_draft_tokens: int,
     temperature: float,
     top_k: int,
+    greedy: bool,
 ):
     """
     Generate tokens with manual speculative decoding.
@@ -140,6 +141,7 @@ def speculative_generate(
             num_draft_tokens=current_block,
             temperature=temperature,
             top_k=top_k,
+            greedy=greedy,
         )
         drafted_tokens += current_block
 
@@ -196,7 +198,12 @@ def speculative_generate(
                 # 3. append that correction token,
                 # 4. crop the draft cache to the same accepted prefix and advance it
                 #    with the correction token instead of re-reading the full sequence.
-                correction_token = sample_remainder(q_probs, p_probs)
+                if greedy:
+                    # Greedy mode keeps the correction deterministic as well, which
+                    # makes repeated benchmark runs easier to compare.
+                    correction_token = torch.argmax(q_probs, dim=-1, keepdim=True)
+                else:
+                    correction_token = sample_remainder(q_probs, p_probs)
                 generated = torch.cat([generated, correction_token], dim=1)
                 all_accepted = False
                 accepted_prefix_cache = trim_past_key_values(
@@ -225,8 +232,7 @@ def speculative_generate(
             target_past_key_values = proposed_target_cache
             target_next_logits = bonus_logits
 
-            bonus_probs = probs_from_logits(target_next_logits, temperature, top_k)
-            bonus_token = sample_from_probs(bonus_probs)
+            _, bonus_token = select_next_token(target_next_logits, temperature, top_k, greedy)
             generated = torch.cat([generated, bonus_token], dim=1)
             target_next_logits, target_past_key_values = advance_model_cache(
                 target_model,
@@ -283,6 +289,7 @@ def main() -> None:
         num_draft_tokens=args.num_draft_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        greedy=args.greedy,
     )
     latency = timed_call_end(device, start)
 
