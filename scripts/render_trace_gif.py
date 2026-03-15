@@ -23,19 +23,23 @@ def load_trace(path: str):
 
 
 def wrap_text(draw, text, font, max_width):
-    words = text.split(" ")
+    paragraphs = text.splitlines() or [text]
     lines = []
-    current = ""
-    for word in words:
-        candidate = word if not current else f"{current} {word}"
-        if draw.textlength(candidate, font=font) <= max_width:
-            current = candidate
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
+    for paragraph in paragraphs:
+        words = paragraph.split(" ")
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if draw.textlength(candidate, font=font) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        if paragraph != paragraphs[-1]:
+            lines.append("")
     return lines
 
 
