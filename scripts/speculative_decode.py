@@ -380,6 +380,7 @@ def main() -> None:
     print("completion:")
     print(text)
     if trace_recorder is not None:
+        trace_recorder.set_response(text)
         trace_recorder.write(args.trace_output)
         print(f"trace_output={args.trace_output}")
 

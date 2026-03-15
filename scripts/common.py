@@ -149,6 +149,7 @@ class TraceRecorder:
         self.prompt = prompt
         self.metadata = metadata
         self.events = []
+        self.response = ""
 
     def record(self, token_id: int, elapsed_s: float, status: str) -> None:
         token_text = self.tokenizer.decode([token_id], skip_special_tokens=False)
@@ -161,9 +162,13 @@ class TraceRecorder:
             }
         )
 
+    def set_response(self, response: str) -> None:
+        self.response = response
+
     def write(self, output_path: str) -> None:
         payload = {
             "prompt": self.prompt,
+            "response": self.response,
             "metadata": self.metadata,
             "events": self.events,
         }
