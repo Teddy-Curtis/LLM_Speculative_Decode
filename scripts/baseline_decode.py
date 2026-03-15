@@ -29,6 +29,7 @@ def autoregressive_generate(
     temperature: float,
     top_k: int,
     greedy: bool,
+    eos_token_id: int | None = None,
     trace_recorder=None,
     trace_start_time: float | None = None,
     device: torch.device | None = None,
@@ -59,6 +60,8 @@ def autoregressive_generate(
                 elapsed_s=time.perf_counter() - trace_start_time,
                 status="emitted",
             )
+        if eos_token_id is not None and next_token.item() == eos_token_id:
+            break
 
     return generated
 
@@ -106,6 +109,7 @@ def main() -> None:
         temperature=args.temperature,
         top_k=args.top_k,
         greedy=args.greedy,
+        eos_token_id=tokenizer.eos_token_id,
         trace_recorder=trace_recorder,
         trace_start_time=start,
         device=device,

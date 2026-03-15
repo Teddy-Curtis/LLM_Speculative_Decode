@@ -103,6 +103,7 @@ def speculative_generate(
     temperature: float,
     top_k: int,
     greedy: bool,
+    eos_token_id: int | None = None,
     trace_recorder=None,
     trace_start_time: float | None = None,
     device: torch.device | None = None,
@@ -212,6 +213,9 @@ def speculative_generate(
                         elapsed_s=time.perf_counter() - trace_start_time,
                         status="accepted_draft",
                     )
+                if eos_token_id is not None and proposed_token.item() == eos_token_id:
+                    all_accepted = False
+                    break
             else:
                 # On rejection we:
                 # 1. crop the verified target cache back to the accepted prefix,
@@ -234,6 +238,14 @@ def speculative_generate(
                         token_id=correction_token.item(),
                         elapsed_s=time.perf_counter() - trace_start_time,
                         status="target_correction",
+                    )
+                if eos_token_id is not None and correction_token.item() == eos_token_id:
+                    return (
+                        generated[:, : input_ids.shape[1] + max_new_tokens],
+                        drafted_tokens,
+                        accepted_tokens,
+                        generated.shape[1] - input_ids.shape[1],
+                        accepted_tokens / drafted_tokens if drafted_tokens > 0 else 0.0,
                     )
                 accepted_prefix_cache = trim_past_key_values(
                     proposed_target_cache,
@@ -270,6 +282,8 @@ def speculative_generate(
                     elapsed_s=time.perf_counter() - trace_start_time,
                     status="target_bonus",
                 )
+            if eos_token_id is not None and bonus_token.item() == eos_token_id:
+                break
             target_next_logits, target_past_key_values = advance_model_cache(
                 target_model,
                 bonus_token,
@@ -343,6 +357,7 @@ def main() -> None:
         temperature=args.temperature,
         top_k=args.top_k,
         greedy=args.greedy,
+        eos_token_id=tokenizer.eos_token_id,
         trace_recorder=trace_recorder,
         trace_start_time=start,
         device=device,

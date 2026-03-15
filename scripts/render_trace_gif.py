@@ -130,7 +130,10 @@ def draw_panel(draw, box, trace, elapsed_s, title, accent, body_font, mono_font,
     generated_lines = wrap_text(draw, visible_text or " ", body_font, (x1 - x0) - 40)
     text_top = cursor_y
     max_text_bottom = y1 - 140
-    for line in generated_lines:
+    available_height = max_text_bottom - text_top
+    max_visible_lines = max(1, available_height // (body_line_height + LINE_SPACING))
+    visible_lines = generated_lines[-max_visible_lines:]
+    for line in visible_lines:
         if cursor_y > max_text_bottom:
             break
         draw.text((x0 + 20, cursor_y), line, fill=INK, font=body_font)
