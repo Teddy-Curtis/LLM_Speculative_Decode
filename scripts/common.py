@@ -134,6 +134,42 @@ def synchronize_if_needed(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+class TraceRecorder:
+    """
+    Collect a per-token timeline for later visualization.
+
+    Each recorded event represents a token that has become part of the committed
+    output sequence. For baseline decoding that is just "one model step
+    completed". For speculative decoding it means "this token is now accepted
+    into the final answer", which may happen after a block verification pass.
+    """
+
+    def __init__(self, tokenizer, prompt: str, metadata: dict):
+        self.tokenizer = tokenizer
+        self.prompt = prompt
+        self.metadata = metadata
+        self.events = []
+
+    def record(self, token_id: int, elapsed_s: float, status: str) -> None:
+        token_text = self.tokenizer.decode([token_id], skip_special_tokens=False)
+        self.events.append(
+            {
+                "token_id": int(token_id),
+                "token_text": token_text,
+                "elapsed_s": float(elapsed_s),
+                "status": status,
+            }
+        )
+
+    def write(self, output_path: str) -> None:
+        payload = {
+            "prompt": self.prompt,
+            "metadata": self.metadata,
+            "events": self.events,
+        }
+        write_json(payload, output_path)
+
+
 def timed_call_start(device: torch.device) -> float:
     synchronize_if_needed(device)
     return time.perf_counter()

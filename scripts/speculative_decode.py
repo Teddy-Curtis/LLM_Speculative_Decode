@@ -1,10 +1,13 @@
 import argparse
 
+import time
+
 import torch
 
 from common import (
     DEFAULT_DRAFT_MODEL,
     DEFAULT_TARGET_MODEL,
+    TraceRecorder,
     advance_model_cache,
     add_sampling_args,
     encode_prompt,
@@ -13,8 +16,10 @@ from common import (
     prime_model_cache,
     probs_from_logits,
     resolve_device,
+    sample_from_probs,
     select_next_token,
     set_seed,
+    synchronize_if_needed,
     timed_call_end,
     timed_call_start,
     trim_past_key_values,
@@ -98,6 +103,9 @@ def speculative_generate(
     temperature: float,
     top_k: int,
     greedy: bool,
+    trace_recorder=None,
+    trace_start_time: float | None = None,
+    device: torch.device | None = None,
 ):
     """
     Generate tokens with manual speculative decoding.
@@ -109,7 +117,7 @@ def speculative_generate(
     4. For each proposed token, accept or reject it using the speculative rule.
     5. If all proposals are accepted, sample one extra "bonus" token from the target.
     6. If a proposal is rejected, crop the target cache back to the accepted prefix,
-       append the correction token, and re-prime the draft model on the new sequence.
+       append the correction token, and update the draft model on the new sequence.
 
     Small example:
         Prompt tokens: [A, B]
@@ -191,6 +199,13 @@ def speculative_generate(
                 generated = torch.cat([generated, proposed_token.unsqueeze(1)], dim=1)
                 accepted_tokens += 1
                 accepted_in_block += 1
+                if trace_recorder is not None and trace_start_time is not None and device is not None:
+                    synchronize_if_needed(device)
+                    trace_recorder.record(
+                        token_id=proposed_token.item(),
+                        elapsed_s=time.perf_counter() - trace_start_time,
+                        status="accepted_draft",
+                    )
             else:
                 # On rejection we:
                 # 1. crop the verified target cache back to the accepted prefix,
@@ -206,6 +221,13 @@ def speculative_generate(
                     correction_token = sample_remainder(q_probs, p_probs)
                 generated = torch.cat([generated, correction_token], dim=1)
                 all_accepted = False
+                if trace_recorder is not None and trace_start_time is not None and device is not None:
+                    synchronize_if_needed(device)
+                    trace_recorder.record(
+                        token_id=correction_token.item(),
+                        elapsed_s=time.perf_counter() - trace_start_time,
+                        status="target_correction",
+                    )
                 accepted_prefix_cache = trim_past_key_values(
                     proposed_target_cache,
                     prefix_length + accepted_in_block,
@@ -234,6 +256,13 @@ def speculative_generate(
 
             _, bonus_token = select_next_token(target_next_logits, temperature, top_k, greedy)
             generated = torch.cat([generated, bonus_token], dim=1)
+            if trace_recorder is not None and trace_start_time is not None and device is not None:
+                synchronize_if_needed(device)
+                trace_recorder.record(
+                    token_id=bonus_token.item(),
+                    elapsed_s=time.perf_counter() - trace_start_time,
+                    status="target_bonus",
+                )
             target_next_logits, target_past_key_values = advance_model_cache(
                 target_model,
                 bonus_token,
@@ -265,6 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--num-draft-tokens", type=int, default=4)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--trace-output", default=None)
     add_sampling_args(parser)
     return parser
 
@@ -278,6 +308,22 @@ def main() -> None:
     draft_model = load_model(args.draft_model, device)
     target_model = load_model(args.target_model, device)
     input_ids = encode_prompt(tokenizer, args.prompt, device)
+    trace_recorder = None
+    if args.trace_output:
+        trace_recorder = TraceRecorder(
+            tokenizer=tokenizer,
+            prompt=args.prompt,
+            metadata={
+                "method": "speculative",
+                "draft_model": args.draft_model,
+                "target_model": args.target_model,
+                "max_new_tokens": args.max_new_tokens,
+                "num_draft_tokens": args.num_draft_tokens,
+                "temperature": args.temperature,
+                "top_k": args.top_k,
+                "greedy": args.greedy,
+            },
+        )
 
     start = timed_call_start(device)
     # Only the decoding loop is timed so the benchmark is not dominated by setup.
@@ -290,6 +336,9 @@ def main() -> None:
         temperature=args.temperature,
         top_k=args.top_k,
         greedy=args.greedy,
+        trace_recorder=trace_recorder,
+        trace_start_time=start,
+        device=device,
     )
     latency = timed_call_end(device, start)
 
@@ -308,6 +357,9 @@ def main() -> None:
     print(f"tokens_per_second={tokens_per_second:.4f}")
     print("completion:")
     print(text)
+    if trace_recorder is not None:
+        trace_recorder.write(args.trace_output)
+        print(f"trace_output={args.trace_output}")
 
 
 if __name__ == "__main__":
