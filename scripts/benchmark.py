@@ -14,6 +14,7 @@ from common import (
     set_seed,
     timed_call_end,
     timed_call_start,
+    write_json,
 )
 from speculative_decode import speculative_generate
 
@@ -86,6 +87,7 @@ def build_parser():
     parser.add_argument("--num-draft-tokens", type=int, default=4)
     parser.add_argument("--device", default=None)
     parser.add_argument("--prompt", action="append", dest="prompts")
+    parser.add_argument("--output", default=None)
     add_sampling_args(parser)
     return parser
 
@@ -133,6 +135,29 @@ def main():
     baseline_latency = summarize(baseline_results, "latency_s")
     speculative_latency = summarize(speculative_results, "latency_s")
     acceptance_rate = summarize(speculative_results, "acceptance_rate")
+    speedup = speculative_tps / baseline_tps if baseline_tps > 0 else None
+
+    payload = {
+        "device": str(device),
+        "draft_model": args.draft_model,
+        "target_model": args.target_model,
+        "num_prompts": len(prompts),
+        "max_new_tokens": args.max_new_tokens,
+        "draft_block_size": args.num_draft_tokens,
+        "temperature": args.temperature,
+        "top_k": args.top_k,
+        "prompts": prompts,
+        "baseline": baseline_results,
+        "speculative": speculative_results,
+        "summary": {
+            "avg_baseline_tokens_per_second": baseline_tps,
+            "avg_baseline_latency_s": baseline_latency,
+            "avg_speculative_tokens_per_second": speculative_tps,
+            "avg_speculative_latency_s": speculative_latency,
+            "avg_acceptance_rate": acceptance_rate,
+            "speedup_vs_baseline": speedup,
+        },
+    }
 
     print(f"device={device}")
     print(f"draft_model={args.draft_model}")
@@ -149,8 +174,13 @@ def main():
     print(f"  avg_tokens_per_second={speculative_tps:.4f}")
     print(f"  avg_latency_s={speculative_latency:.4f}")
     print(f"  avg_acceptance_rate={acceptance_rate:.4f}")
-    if baseline_tps > 0:
-        print(f"  speedup_vs_baseline={speculative_tps / baseline_tps:.4f}x")
+    if speedup is not None:
+        print(f"  speedup_vs_baseline={speedup:.4f}x")
+
+    if args.output:
+        write_json(payload, args.output)
+        print()
+        print(f"saved_results={args.output}")
 
 
 if __name__ == "__main__":

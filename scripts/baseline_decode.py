@@ -4,10 +4,12 @@ import torch
 
 from common import (
     DEFAULT_TARGET_MODEL,
+    advance_model_cache,
     add_sampling_args,
     encode_prompt,
     load_model,
     load_tokenizer,
+    prime_model_cache,
     probs_from_logits,
     resolve_device,
     sample_from_probs,
@@ -26,19 +28,13 @@ def autoregressive_generate(
     top_k: int,
 ):
     generated = input_ids.clone()
-    past_key_values = None
+    logits, past_key_values = prime_model_cache(model, generated)
 
     for _ in range(max_new_tokens):
-        model_inputs = generated if past_key_values is None else generated[:, -1:]
-        outputs = model(
-            input_ids=model_inputs,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        past_key_values = outputs.past_key_values
-        next_token_probs = probs_from_logits(outputs.logits[:, -1, :], temperature, top_k)
+        next_token_probs = probs_from_logits(logits, temperature, top_k)
         next_token = sample_from_probs(next_token_probs)
         generated = torch.cat([generated, next_token], dim=1)
+        logits, past_key_values = advance_model_cache(model, next_token, past_key_values)
 
     return generated
 
@@ -87,4 +83,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

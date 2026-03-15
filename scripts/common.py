@@ -1,6 +1,8 @@
 import argparse
+import json
 import random
 import time
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -86,3 +88,35 @@ def timed_call_end(device: torch.device, start_time: float) -> float:
     synchronize_if_needed(device)
     return time.perf_counter() - start_time
 
+
+def prime_model_cache(model, input_ids: torch.Tensor):
+    outputs = model(input_ids=input_ids, use_cache=True)
+    return outputs.logits[:, -1, :], outputs.past_key_values
+
+
+def advance_model_cache(model, next_input_ids: torch.Tensor, past_key_values):
+    outputs = model(
+        input_ids=next_input_ids,
+        past_key_values=past_key_values,
+        use_cache=True,
+    )
+    return outputs.logits[:, -1, :], outputs.past_key_values
+
+
+def trim_past_key_values(past_key_values, sequence_length: int):
+    trimmed = []
+    for layer in past_key_values:
+        trimmed_layer = []
+        for tensor in layer:
+            if tensor.dim() >= 3:
+                trimmed_layer.append(tensor[..., :sequence_length, :])
+            else:
+                trimmed_layer.append(tensor)
+        trimmed.append(tuple(trimmed_layer))
+    return tuple(trimmed)
+
+
+def write_json(payload, output_path: str) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")

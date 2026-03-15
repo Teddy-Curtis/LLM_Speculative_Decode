@@ -1,63 +1,50 @@
 import argparse
-from dataclasses import dataclass
 
 import torch
 
 from common import (
     DEFAULT_DRAFT_MODEL,
     DEFAULT_TARGET_MODEL,
+    advance_model_cache,
     add_sampling_args,
     encode_prompt,
     load_model,
     load_tokenizer,
+    prime_model_cache,
     probs_from_logits,
     resolve_device,
     sample_from_probs,
     set_seed,
     timed_call_end,
     timed_call_start,
+    trim_past_key_values,
 )
-
-
-@dataclass
-class SpeculativeStats:
-    generated_tokens: int
-    drafted_tokens: int
-    accepted_tokens: int
-    acceptance_rate: float
-    latency_s: float
 
 
 @torch.no_grad()
 def generate_draft_tokens(
     draft_model,
-    prefix_ids: torch.Tensor,
+    draft_past_key_values,
+    next_logits: torch.Tensor,
     num_draft_tokens: int,
     temperature: float,
     top_k: int,
 ):
     proposal_tokens = []
     proposal_probs = []
-    running_ids = prefix_ids
-    past_key_values = None
+    past_key_values = draft_past_key_values
+    logits = next_logits
 
     for _ in range(num_draft_tokens):
-        model_inputs = running_ids if past_key_values is None else running_ids[:, -1:]
-        outputs = draft_model(
-            input_ids=model_inputs,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        past_key_values = outputs.past_key_values
-        probs = probs_from_logits(outputs.logits[:, -1, :], temperature, top_k)
+        probs = probs_from_logits(logits, temperature, top_k)
         token = sample_from_probs(probs)
         proposal_tokens.append(token)
         proposal_probs.append(probs)
-        running_ids = torch.cat([running_ids, token], dim=1)
+        logits, past_key_values = advance_model_cache(draft_model, token, past_key_values)
 
     stacked_tokens = torch.cat(proposal_tokens, dim=1)
     stacked_probs = torch.stack(proposal_probs, dim=1)
-    return stacked_tokens, stacked_probs
+    return stacked_tokens, stacked_probs, past_key_values, logits
 
 
 def sample_remainder(target_probs: torch.Tensor, draft_probs: torch.Tensor) -> torch.Tensor:
@@ -85,30 +72,35 @@ def speculative_generate(
     generated = input_ids.clone()
     drafted_tokens = 0
     accepted_tokens = 0
+    draft_next_logits, draft_past_key_values = prime_model_cache(draft_model, generated)
+    target_next_logits, target_past_key_values = prime_model_cache(target_model, generated)
 
     while generated.shape[1] - input_ids.shape[1] < max_new_tokens:
         remaining = max_new_tokens - (generated.shape[1] - input_ids.shape[1])
         current_block = min(num_draft_tokens, remaining)
+        prefix_length = generated.shape[1]
 
-        draft_tokens, draft_probs = generate_draft_tokens(
+        draft_tokens, draft_probs, proposed_draft_cache, proposed_draft_logits = generate_draft_tokens(
             draft_model=draft_model,
-            prefix_ids=generated,
+            draft_past_key_values=draft_past_key_values,
+            next_logits=draft_next_logits,
             num_draft_tokens=current_block,
             temperature=temperature,
             top_k=top_k,
         )
         drafted_tokens += current_block
 
-        verification_input = torch.cat([generated, draft_tokens], dim=1)
-        target_outputs = target_model(verification_input, use_cache=False)
-        verification_logits = target_outputs.logits[
-            :,
-            generated.shape[1] - 1 : verification_input.shape[1],
-            :,
-        ]
-        target_probs = probs_from_logits(verification_logits, temperature, top_k)
+        target_outputs = target_model(
+            input_ids=draft_tokens,
+            past_key_values=target_past_key_values,
+            use_cache=True,
+        )
+        proposed_target_cache = target_outputs.past_key_values
+        target_probs = probs_from_logits(target_outputs.logits, temperature, top_k)
+        bonus_logits = target_outputs.logits[:, -1, :]
 
         all_accepted = True
+        accepted_in_block = 0
         for step in range(current_block):
             proposed_token = draft_tokens[:, step]
             q_probs = target_probs[:, step, :]
@@ -124,16 +116,48 @@ def speculative_generate(
             if torch.rand(1, device=generated.device).item() <= accept_prob.item():
                 generated = torch.cat([generated, proposed_token.unsqueeze(1)], dim=1)
                 accepted_tokens += 1
+                accepted_in_block += 1
             else:
                 correction_token = sample_remainder(q_probs, p_probs)
                 generated = torch.cat([generated, correction_token], dim=1)
                 all_accepted = False
+                accepted_prefix_cache = trim_past_key_values(
+                    proposed_target_cache,
+                    prefix_length + accepted_in_block,
+                )
+                target_next_logits, target_past_key_values = advance_model_cache(
+                    target_model,
+                    correction_token,
+                    accepted_prefix_cache,
+                )
+
+                refreshed_logits, refreshed_cache = prime_model_cache(draft_model, generated)
+                draft_next_logits = refreshed_logits
+                draft_past_key_values = refreshed_cache
                 break
 
         if all_accepted and generated.shape[1] - input_ids.shape[1] < max_new_tokens:
-            bonus_probs = target_probs[:, current_block, :]
+            target_past_key_values = proposed_target_cache
+            target_next_logits = bonus_logits
+
+            bonus_probs = probs_from_logits(target_next_logits, temperature, top_k)
             bonus_token = sample_from_probs(bonus_probs)
             generated = torch.cat([generated, bonus_token], dim=1)
+            target_next_logits, target_past_key_values = advance_model_cache(
+                target_model,
+                bonus_token,
+                target_past_key_values,
+            )
+            draft_next_logits, draft_past_key_values = advance_model_cache(
+                draft_model,
+                bonus_token,
+                proposed_draft_cache,
+            )
+        elif all_accepted:
+            target_past_key_values = proposed_target_cache
+            target_next_logits = bonus_logits
+            draft_past_key_values = proposed_draft_cache
+            draft_next_logits = proposed_draft_logits
 
     new_tokens = generated.shape[1] - input_ids.shape[1]
     acceptance_rate = accepted_tokens / drafted_tokens if drafted_tokens > 0 else 0.0
@@ -193,4 +217,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
