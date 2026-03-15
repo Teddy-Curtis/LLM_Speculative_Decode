@@ -108,7 +108,9 @@ def trim_past_key_values(past_key_values, sequence_length: int):
     for layer in past_key_values:
         trimmed_layer = []
         for tensor in layer:
-            if tensor.dim() >= 3:
+            if tensor is None:
+                trimmed_layer.append(None)
+            elif tensor.dim() >= 3:
                 trimmed_layer.append(tensor[..., :sequence_length, :])
             else:
                 trimmed_layer.append(tensor)
