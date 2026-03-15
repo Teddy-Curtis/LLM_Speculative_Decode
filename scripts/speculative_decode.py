@@ -1,0 +1,196 @@
+import argparse
+from dataclasses import dataclass
+
+import torch
+
+from common import (
+    DEFAULT_DRAFT_MODEL,
+    DEFAULT_TARGET_MODEL,
+    add_sampling_args,
+    encode_prompt,
+    load_model,
+    load_tokenizer,
+    probs_from_logits,
+    resolve_device,
+    sample_from_probs,
+    set_seed,
+    timed_call_end,
+    timed_call_start,
+)
+
+
+@dataclass
+class SpeculativeStats:
+    generated_tokens: int
+    drafted_tokens: int
+    accepted_tokens: int
+    acceptance_rate: float
+    latency_s: float
+
+
+@torch.no_grad()
+def generate_draft_tokens(
+    draft_model,
+    prefix_ids: torch.Tensor,
+    num_draft_tokens: int,
+    temperature: float,
+    top_k: int,
+):
+    proposal_tokens = []
+    proposal_probs = []
+    running_ids = prefix_ids
+    past_key_values = None
+
+    for _ in range(num_draft_tokens):
+        model_inputs = running_ids if past_key_values is None else running_ids[:, -1:]
+        outputs = draft_model(
+            input_ids=model_inputs,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        probs = probs_from_logits(outputs.logits[:, -1, :], temperature, top_k)
+        token = sample_from_probs(probs)
+        proposal_tokens.append(token)
+        proposal_probs.append(probs)
+        running_ids = torch.cat([running_ids, token], dim=1)
+
+    stacked_tokens = torch.cat(proposal_tokens, dim=1)
+    stacked_probs = torch.stack(proposal_probs, dim=1)
+    return stacked_tokens, stacked_probs
+
+
+def sample_remainder(target_probs: torch.Tensor, draft_probs: torch.Tensor) -> torch.Tensor:
+    remainder = torch.clamp(target_probs - draft_probs, min=0.0)
+    normalizer = remainder.sum(dim=-1, keepdim=True)
+    fallback = normalizer.squeeze(-1) <= 0
+    if fallback.any():
+        remainder = remainder.clone()
+        remainder[fallback] = target_probs[fallback]
+        normalizer = remainder.sum(dim=-1, keepdim=True)
+    remainder = remainder / normalizer
+    return sample_from_probs(remainder)
+
+
+@torch.no_grad()
+def speculative_generate(
+    draft_model,
+    target_model,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    num_draft_tokens: int,
+    temperature: float,
+    top_k: int,
+):
+    generated = input_ids.clone()
+    drafted_tokens = 0
+    accepted_tokens = 0
+
+    while generated.shape[1] - input_ids.shape[1] < max_new_tokens:
+        remaining = max_new_tokens - (generated.shape[1] - input_ids.shape[1])
+        current_block = min(num_draft_tokens, remaining)
+
+        draft_tokens, draft_probs = generate_draft_tokens(
+            draft_model=draft_model,
+            prefix_ids=generated,
+            num_draft_tokens=current_block,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        drafted_tokens += current_block
+
+        verification_input = torch.cat([generated, draft_tokens], dim=1)
+        target_outputs = target_model(verification_input, use_cache=False)
+        verification_logits = target_outputs.logits[
+            :,
+            generated.shape[1] - 1 : verification_input.shape[1],
+            :,
+        ]
+        target_probs = probs_from_logits(verification_logits, temperature, top_k)
+
+        all_accepted = True
+        for step in range(current_block):
+            proposed_token = draft_tokens[:, step]
+            q_probs = target_probs[:, step, :]
+            p_probs = draft_probs[:, step, :]
+
+            q_token_prob = q_probs.gather(1, proposed_token.unsqueeze(1)).squeeze(1)
+            p_token_prob = p_probs.gather(1, proposed_token.unsqueeze(1)).squeeze(1)
+            accept_prob = torch.minimum(
+                torch.ones_like(q_token_prob),
+                q_token_prob / torch.clamp(p_token_prob, min=1e-12),
+            )
+
+            if torch.rand(1, device=generated.device).item() <= accept_prob.item():
+                generated = torch.cat([generated, proposed_token.unsqueeze(1)], dim=1)
+                accepted_tokens += 1
+            else:
+                correction_token = sample_remainder(q_probs, p_probs)
+                generated = torch.cat([generated, correction_token], dim=1)
+                all_accepted = False
+                break
+
+        if all_accepted and generated.shape[1] - input_ids.shape[1] < max_new_tokens:
+            bonus_probs = target_probs[:, current_block, :]
+            bonus_token = sample_from_probs(bonus_probs)
+            generated = torch.cat([generated, bonus_token], dim=1)
+
+    new_tokens = generated.shape[1] - input_ids.shape[1]
+    acceptance_rate = accepted_tokens / drafted_tokens if drafted_tokens > 0 else 0.0
+    return generated[:, : input_ids.shape[1] + max_new_tokens], drafted_tokens, accepted_tokens, new_tokens, acceptance_rate
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manual speculative decoding.")
+    parser.add_argument("--draft-model", default=DEFAULT_DRAFT_MODEL)
+    parser.add_argument("--target-model", default=DEFAULT_TARGET_MODEL)
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--num-draft-tokens", type=int, default=4)
+    parser.add_argument("--device", default=None)
+    add_sampling_args(parser)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    set_seed(args.seed)
+
+    device = resolve_device(args.device)
+    tokenizer = load_tokenizer(args.target_model)
+    draft_model = load_model(args.draft_model, device)
+    target_model = load_model(args.target_model, device)
+    input_ids = encode_prompt(tokenizer, args.prompt, device)
+
+    start = timed_call_start(device)
+    generated, drafted_tokens, accepted_tokens, new_tokens, acceptance_rate = speculative_generate(
+        draft_model=draft_model,
+        target_model=target_model,
+        input_ids=input_ids,
+        max_new_tokens=args.max_new_tokens,
+        num_draft_tokens=args.num_draft_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
+    latency = timed_call_end(device, start)
+
+    completion = generated[:, input_ids.shape[1] :]
+    text = tokenizer.decode(completion[0], skip_special_tokens=True)
+    tokens_per_second = new_tokens / latency if latency > 0 else float("inf")
+
+    print(f"draft_model={args.draft_model}")
+    print(f"target_model={args.target_model}")
+    print(f"device={device}")
+    print(f"generated_tokens={new_tokens}")
+    print(f"drafted_tokens={drafted_tokens}")
+    print(f"accepted_tokens={accepted_tokens}")
+    print(f"acceptance_rate={acceptance_rate:.4f}")
+    print(f"latency_s={latency:.4f}")
+    print(f"tokens_per_second={tokens_per_second:.4f}")
+    print("completion:")
+    print(text)
+
+
+if __name__ == "__main__":
+    main()
+
