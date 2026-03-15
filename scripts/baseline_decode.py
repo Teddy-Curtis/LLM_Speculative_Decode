@@ -27,10 +27,22 @@ def autoregressive_generate(
     temperature: float,
     top_k: int,
 ):
+    """
+    Standard left-to-right decoding using one model and its KV cache.
+
+    Example flow:
+    1. Read the full prompt once to build the cache.
+    2. Sample the next token from the current logits.
+    3. Feed only that token back into the model with the cached prefix.
+    4. Repeat until `max_new_tokens` have been produced.
+
+    This is the baseline we compare speculative decoding against.
+    """
     generated = input_ids.clone()
     logits, past_key_values = prime_model_cache(model, generated)
 
     for _ in range(max_new_tokens):
+        # `logits` always represents "what should come next after the current prefix".
         next_token_probs = probs_from_logits(logits, temperature, top_k)
         next_token = sample_from_probs(next_token_probs)
         generated = torch.cat([generated, next_token], dim=1)
@@ -59,6 +71,7 @@ def main() -> None:
     input_ids = encode_prompt(tokenizer, args.prompt, device)
 
     start = timed_call_start(device)
+    # We time only the actual generation call, not model loading or tokenization.
     generated = autoregressive_generate(
         model=model,
         input_ids=input_ids,

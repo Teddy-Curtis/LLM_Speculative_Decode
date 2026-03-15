@@ -27,6 +27,7 @@ DEFAULT_PROMPTS = [
 
 
 def run_baseline(model, input_ids, max_new_tokens, temperature, top_k, device):
+    """Run one baseline decode and return metrics in a JSON-friendly dict."""
     start = timed_call_start(device)
     generated = autoregressive_generate(
         model=model,
@@ -54,6 +55,7 @@ def run_speculative(
     top_k,
     device,
 ):
+    """Run one speculative decode and return metrics in a JSON-friendly dict."""
     start = timed_call_start(device)
     _, drafted_tokens, accepted_tokens, generated_tokens, acceptance_rate = speculative_generate(
         draft_model=draft_model,
@@ -76,6 +78,7 @@ def run_speculative(
 
 
 def summarize(results: List[Dict[str, float]], key: str) -> float:
+    """Average one metric across prompts."""
     return statistics.mean(result[key] for result in results)
 
 
@@ -106,6 +109,8 @@ def main():
     speculative_results = []
 
     for prompt in prompts:
+        # Each prompt is benchmarked independently so we can average across a
+        # small fixed prompt set rather than overfitting to one lucky example.
         input_ids = encode_prompt(tokenizer, prompt, device)
         baseline_results.append(
             run_baseline(
@@ -159,6 +164,8 @@ def main():
         },
     }
 
+    # The printed output is meant for quick human inspection in Colab.
+    # The optional JSON file is meant for later comparison across runs.
     print(f"device={device}")
     print(f"draft_model={args.draft_model}")
     print(f"target_model={args.target_model}")

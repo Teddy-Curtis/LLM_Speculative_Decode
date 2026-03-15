@@ -30,16 +30,34 @@ def generate_draft_tokens(
     temperature: float,
     top_k: int,
 ):
+    """
+    Ask the draft model to propose a short block of future tokens.
+
+    Inputs:
+    - `draft_past_key_values`: cache for the already accepted prefix
+    - `next_logits`: distribution for the next token after that prefix
+
+    Returns:
+    - `stacked_tokens`: proposed tokens, shape `[1, block_size]`
+    - `stacked_probs`: draft probabilities for each proposal step
+    - updated cache/logits after rolling the draft model forward through the block
+
+    Example:
+        If the accepted prefix is "The capital of France is", this function might
+        propose `[" Paris", ",", " and", " it"]` one token at a time.
+    """
     proposal_tokens = []
     proposal_probs = []
     past_key_values = draft_past_key_values
     logits = next_logits
 
     for _ in range(num_draft_tokens):
+        # Sample from the draft model's current next-token distribution.
         probs = probs_from_logits(logits, temperature, top_k)
         token = sample_from_probs(probs)
         proposal_tokens.append(token)
         proposal_probs.append(probs)
+        # Roll the draft cache forward so the next loop iteration sees a longer prefix.
         logits, past_key_values = advance_model_cache(draft_model, token, past_key_values)
 
     stacked_tokens = torch.cat(proposal_tokens, dim=1)
@@ -48,6 +66,17 @@ def generate_draft_tokens(
 
 
 def sample_remainder(target_probs: torch.Tensor, draft_probs: torch.Tensor) -> torch.Tensor:
+    """
+    Sample from the "correction" distribution used after a rejection.
+
+    In speculative decoding, if the target rejects a proposed draft token, we do
+    not simply sample from the target distribution again. Instead we sample from
+    the positive part of:
+
+        target_probs - draft_probs
+
+    This preserves the correct target-model distribution overall.
+    """
     remainder = torch.clamp(target_probs - draft_probs, min=0.0)
     normalizer = remainder.sum(dim=-1, keepdim=True)
     fallback = normalizer.squeeze(-1) <= 0
@@ -69,9 +98,32 @@ def speculative_generate(
     temperature: float,
     top_k: int,
 ):
+    """
+    Generate tokens with manual speculative decoding.
+
+    High-level algorithm:
+    1. Prime both draft and target models on the same prompt.
+    2. Let the draft model propose a short block of `num_draft_tokens`.
+    3. Run the target model over that block in one go using the cached prefix.
+    4. For each proposed token, accept or reject it using the speculative rule.
+    5. If all proposals are accepted, sample one extra "bonus" token from the target.
+    6. If a proposal is rejected, crop the target cache back to the accepted prefix,
+       append the correction token, and re-prime the draft model on the new sequence.
+
+    Small example:
+        Prompt tokens: [A, B]
+        Draft proposes: [C, D, E]
+        Target verifies:
+        - accept C
+        - reject D
+        Then the final continuation for this block becomes:
+            [C, correction_token]
+        and the remaining proposals after D are discarded.
+    """
     generated = input_ids.clone()
     drafted_tokens = 0
     accepted_tokens = 0
+    # Both models start from the exact same prompt prefix.
     draft_next_logits, draft_past_key_values = prime_model_cache(draft_model, generated)
     target_next_logits, target_past_key_values = prime_model_cache(target_model, generated)
 
@@ -80,6 +132,7 @@ def speculative_generate(
         current_block = min(num_draft_tokens, remaining)
         prefix_length = generated.shape[1]
 
+        # Step 1: the draft model cheaply proposes several future tokens.
         draft_tokens, draft_probs, proposed_draft_cache, proposed_draft_logits = generate_draft_tokens(
             draft_model=draft_model,
             draft_past_key_values=draft_past_key_values,
@@ -90,6 +143,8 @@ def speculative_generate(
         )
         drafted_tokens += current_block
 
+        # Step 2: the target model verifies the entire proposed block against the
+        # current accepted prefix using its own KV cache.
         target_outputs = target_model(
             input_ids=draft_tokens,
             past_key_values=target_past_key_values,
@@ -106,6 +161,9 @@ def speculative_generate(
             q_probs = target_probs[:, step, :]
             p_probs = draft_probs[:, step, :]
 
+            # The acceptance probability is min(1, q(x) / p(x)) where:
+            # - q is the target-model distribution
+            # - p is the draft-model distribution
             q_token_prob = q_probs.gather(1, proposed_token.unsqueeze(1)).squeeze(1)
             p_token_prob = p_probs.gather(1, proposed_token.unsqueeze(1)).squeeze(1)
             accept_prob = torch.minimum(
@@ -114,10 +172,16 @@ def speculative_generate(
             )
 
             if torch.rand(1, device=generated.device).item() <= accept_prob.item():
+                # Accepted draft tokens become part of the final output exactly as proposed.
                 generated = torch.cat([generated, proposed_token.unsqueeze(1)], dim=1)
                 accepted_tokens += 1
                 accepted_in_block += 1
             else:
+                # On rejection we:
+                # 1. crop the verified target cache back to the accepted prefix,
+                # 2. sample a correction token from the remainder distribution,
+                # 3. append that correction token,
+                # 4. re-prime the draft model because its proposed future is no longer valid.
                 correction_token = sample_remainder(q_probs, p_probs)
                 generated = torch.cat([generated, correction_token], dim=1)
                 all_accepted = False
@@ -137,6 +201,8 @@ def speculative_generate(
                 break
 
         if all_accepted and generated.shape[1] - input_ids.shape[1] < max_new_tokens:
+            # If the target accepted the entire block, we get one extra token "for free"
+            # from the target model's final verification logits.
             target_past_key_values = proposed_target_cache
             target_next_logits = bonus_logits
 
@@ -154,6 +220,8 @@ def speculative_generate(
                 proposed_draft_cache,
             )
         elif all_accepted:
+            # If we accepted the full block but have already reached `max_new_tokens`,
+            # keep the advanced caches without sampling the bonus token.
             target_past_key_values = proposed_target_cache
             target_next_logits = bonus_logits
             draft_past_key_values = proposed_draft_cache
@@ -187,6 +255,7 @@ def main() -> None:
     input_ids = encode_prompt(tokenizer, args.prompt, device)
 
     start = timed_call_start(device)
+    # Only the decoding loop is timed so the benchmark is not dominated by setup.
     generated, drafted_tokens, accepted_tokens, new_tokens, acceptance_rate = speculative_generate(
         draft_model=draft_model,
         target_model=target_model,
