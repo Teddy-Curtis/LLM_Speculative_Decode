@@ -151,7 +151,20 @@ def speculative_generate(
             use_cache=True,
         )
         proposed_target_cache = target_outputs.past_key_values
-        target_probs = probs_from_logits(target_outputs.logits, temperature, top_k)
+        # `target_outputs.logits[:, j, :]` is the distribution *after* consuming
+        # `draft_tokens[:, j]`. For verification we instead need:
+        #
+        # - step 0: distribution after the accepted prefix and before draft token 0
+        # - step 1: distribution after draft token 0 and before draft token 1
+        # - ...
+        #
+        # So the correct verification logits are:
+        #   [target_next_logits, target_outputs.logits[:, :-1, :]]
+        verification_logits = torch.cat(
+            [target_next_logits.unsqueeze(1), target_outputs.logits[:, :-1, :]],
+            dim=1,
+        )
+        target_probs = probs_from_logits(verification_logits, temperature, top_k)
         bonus_logits = target_outputs.logits[:, -1, :]
 
         all_accepted = True
