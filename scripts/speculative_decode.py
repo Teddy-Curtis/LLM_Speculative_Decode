@@ -194,7 +194,8 @@ def speculative_generate(
                 # 1. crop the verified target cache back to the accepted prefix,
                 # 2. sample a correction token from the remainder distribution,
                 # 3. append that correction token,
-                # 4. re-prime the draft model because its proposed future is no longer valid.
+                # 4. crop the draft cache to the same accepted prefix and advance it
+                #    with the correction token instead of re-reading the full sequence.
                 correction_token = sample_remainder(q_probs, p_probs)
                 generated = torch.cat([generated, correction_token], dim=1)
                 all_accepted = False
@@ -207,10 +208,15 @@ def speculative_generate(
                     correction_token,
                     accepted_prefix_cache,
                 )
-
-                refreshed_logits, refreshed_cache = prime_model_cache(draft_model, generated)
-                draft_next_logits = refreshed_logits
-                draft_past_key_values = refreshed_cache
+                accepted_draft_cache = trim_past_key_values(
+                    proposed_draft_cache,
+                    prefix_length + accepted_in_block,
+                )
+                draft_next_logits, draft_past_key_values = advance_model_cache(
+                    draft_model,
+                    correction_token,
+                    accepted_draft_cache,
+                )
                 break
 
         if all_accepted and generated.shape[1] - input_ids.shape[1] < max_new_tokens:
