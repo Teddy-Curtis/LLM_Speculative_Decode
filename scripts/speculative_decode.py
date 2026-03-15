@@ -183,6 +183,7 @@ def speculative_generate(
             proposed_token = draft_tokens[:, step]
             q_probs = target_probs[:, step, :]
             p_probs = draft_probs[:, step, :]
+            target_greedy_token = torch.argmax(q_probs, dim=-1, keepdim=True)
 
             # The acceptance probability is min(1, q(x) / p(x)) where:
             # - q is the target-model distribution
@@ -194,7 +195,12 @@ def speculative_generate(
                 q_token_prob / torch.clamp(p_token_prob, min=1e-12),
             )
 
-            if torch.rand(1, device=generated.device).item() <= accept_prob.item():
+            if greedy:
+                accept_token = torch.equal(proposed_token.unsqueeze(1), target_greedy_token)
+            else:
+                accept_token = torch.rand(1, device=generated.device).item() <= accept_prob.item()
+
+            if accept_token:
                 # Accepted draft tokens become part of the final output exactly as proposed.
                 generated = torch.cat([generated, proposed_token.unsqueeze(1)], dim=1)
                 accepted_tokens += 1
@@ -214,9 +220,10 @@ def speculative_generate(
                 # 4. crop the draft cache to the same accepted prefix and advance it
                 #    with the correction token instead of re-reading the full sequence.
                 if greedy:
-                    # Greedy mode keeps the correction deterministic as well, which
-                    # makes repeated benchmark runs easier to compare.
-                    correction_token = torch.argmax(q_probs, dim=-1, keepdim=True)
+                    # In greedy mode we force speculative decoding to follow the
+                    # target model's greedy path exactly so visual comparisons can
+                    # show the same text appearing at different times.
+                    correction_token = target_greedy_token
                 else:
                     correction_token = sample_remainder(q_probs, p_probs)
                 generated = torch.cat([generated, correction_token], dim=1)

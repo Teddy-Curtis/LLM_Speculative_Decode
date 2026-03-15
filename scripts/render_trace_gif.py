@@ -1,6 +1,8 @@
 import argparse
 import json
 import math
+import re
+import subprocess
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -11,22 +13,59 @@ HEIGHT = 900
 PADDING = 36
 HEADER_GAP = 28
 PANEL_GAP = 32
-LINE_SPACING = 10
-BODY_LINE_HEIGHT = 22
+LINE_SPACING = 2
 BACKGROUND = (248, 245, 238)
 INK = (26, 26, 26)
 MUTED = (90, 90, 90)
 ACCENT_LEFT = (42, 91, 167)
 ACCENT_RIGHT = (205, 94, 70)
+
+TITLE_FONT_SIZE = 30
+BODY_FONT_SIZE = 24
+MONO_FONT_SIZE = 18
+
+
+def find_font(family: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["fc-match", "-f", "%{file}\n", family],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        path = result.stdout.strip()
+        return path or None
+    except Exception:
+        return None
+
+
+def load_font(family: str, size: int):
+    path = find_font(family)
+    if path:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def line_height(font, fallback: int) -> int:
+    bbox = font.getbbox("Ag")
+    if bbox is None:
+        return fallback
+    return max(fallback, bbox[3] - bbox[1])
 def load_trace(path: str):
     return json.loads(Path(path).read_text())
 
 
 def wrap_text(draw, text, font, max_width):
-    paragraphs = text.splitlines() or [text]
+    paragraphs = [paragraph for paragraph in text.splitlines() if paragraph.strip() != ""] or [text]
     lines = []
     for paragraph in paragraphs:
-        words = paragraph.split(" ")
+        normalized = re.sub(r"\s+", " ", paragraph).strip()
+        if not normalized:
+            continue
+        words = normalized.split(" ")
         current = ""
         for word in words:
             candidate = word if not current else f"{current} {word}"
@@ -61,6 +100,8 @@ def format_status_counts(events, elapsed_s):
 
 def draw_panel(draw, box, trace, elapsed_s, title, accent, body_font, mono_font, title_font):
     x0, y0, x1, y1 = box
+    body_line_height = line_height(body_font, 24)
+
     draw.rounded_rectangle(box, radius=24, fill=(255, 255, 255), outline=accent, width=3)
 
     draw.text((x0 + 20, y0 + 18), title, fill=accent, font=title_font)
@@ -79,7 +120,7 @@ def draw_panel(draw, box, trace, elapsed_s, title, accent, body_font, mono_font,
     cursor_y = prompt_label_y + 30
     for line in prompt_lines:
         draw.text((x0 + 20, cursor_y), line, fill=INK, font=body_font)
-        cursor_y += BODY_LINE_HEIGHT + LINE_SPACING
+        cursor_y += body_line_height + LINE_SPACING
 
     cursor_y += 16
     draw.text((x0 + 20, cursor_y), "Generated", fill=MUTED, font=mono_font)
@@ -93,7 +134,7 @@ def draw_panel(draw, box, trace, elapsed_s, title, accent, body_font, mono_font,
         if cursor_y > max_text_bottom:
             break
         draw.text((x0 + 20, cursor_y), line, fill=INK, font=body_font)
-        cursor_y += BODY_LINE_HEIGHT + LINE_SPACING
+        cursor_y += body_line_height + LINE_SPACING
 
     stats_y = y1 - 108
     visible_tokens = count_visible_tokens(trace["events"], elapsed_s)
@@ -107,9 +148,9 @@ def draw_panel(draw, box, trace, elapsed_s, title, accent, body_font, mono_font,
 def render_frame(left_trace, right_trace, elapsed_s, output_path):
     image = Image.new("RGB", (WIDTH, HEIGHT), color=BACKGROUND)
     draw = ImageDraw.Draw(image)
-    title_font = ImageFont.load_default()
-    body_font = ImageFont.load_default()
-    mono_font = ImageFont.load_default()
+    title_font = load_font("sans", TITLE_FONT_SIZE)
+    body_font = load_font("sans", BODY_FONT_SIZE)
+    mono_font = load_font("monospace", MONO_FONT_SIZE)
 
     draw.text((PADDING, PADDING), "Token Timeline Comparison", fill=INK, font=title_font)
     subtitle = "Each token appears when it becomes part of the committed output sequence."
