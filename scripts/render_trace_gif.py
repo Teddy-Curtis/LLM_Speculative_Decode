@@ -9,9 +9,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 WIDTH = 1500
-HEIGHT = 900
-PADDING = 36
-HEADER_GAP = 28
+HEIGHT = 800
+PADDING = 28
+HEADER_GAP = 38
 PANEL_GAP = 32
 LINE_SPACING = 2
 BACKGROUND = (248, 245, 238)
@@ -101,20 +101,31 @@ def format_status_counts(events, elapsed_s):
 def draw_panel(draw, box, trace, elapsed_s, title, accent, body_font, mono_font, title_font):
     x0, y0, x1, y1 = box
     body_line_height = line_height(body_font, 24)
+    trace_end = trace["events"][-1]["elapsed_s"] if trace["events"] else 0.0
+    panel_elapsed = min(elapsed_s, trace_end)
 
     draw.rounded_rectangle(box, radius=24, fill=(255, 255, 255), outline=accent, width=3)
 
     draw.text((x0 + 20, y0 + 18), title, fill=accent, font=title_font)
     metadata = trace["metadata"]
-    meta_line = metadata.get("model") or (
-        f"{metadata.get('draft_model')} -> {metadata.get('target_model')}"
-    )
-    draw.text((x0 + 20, y0 + 62), meta_line, fill=MUTED, font=mono_font)
+    if metadata.get("method") == "baseline":
+        meta_lines = [f"Target: {metadata.get('model', 'unknown')}"]
+    else:
+        meta_lines = [
+            f"Draft: {metadata.get('draft_model', 'unknown')}",
+            f"Target: {metadata.get('target_model', 'unknown')}",
+        ]
+    meta_y = y0 + 62
+    for meta_line in meta_lines:
+        draw.text((x0 + 20, meta_y), meta_line, fill=MUTED, font=mono_font)
+        meta_y += 26
 
-    timer_text = f"t = {elapsed_s:0.2f}s"
+    timer_text = f"t = {panel_elapsed:0.2f}s"
     draw.text((x1 - 200, y0 + 20), timer_text, fill=INK, font=mono_font)
+    if elapsed_s > trace_end:
+        draw.text((x1 - 200, y0 + 48), "finished", fill=MUTED, font=mono_font)
 
-    prompt_label_y = y0 + 108
+    prompt_label_y = y0 + 118 if len(meta_lines) == 1 else y0 + 144
     draw.text((x0 + 20, prompt_label_y), "Prompt", fill=MUTED, font=mono_font)
     prompt_lines = wrap_text(draw, trace["prompt"], body_font, (x1 - x0) - 40)
     cursor_y = prompt_label_y + 30
@@ -126,10 +137,10 @@ def draw_panel(draw, box, trace, elapsed_s, title, accent, body_font, mono_font,
     draw.text((x0 + 20, cursor_y), "Generated", fill=MUTED, font=mono_font)
     cursor_y += 30
 
-    visible_text = build_visible_text(trace["events"], elapsed_s)
+    visible_text = build_visible_text(trace["events"], panel_elapsed)
     generated_lines = wrap_text(draw, visible_text or " ", body_font, (x1 - x0) - 40)
     text_top = cursor_y
-    max_text_bottom = y1 - 140
+    max_text_bottom = y1 - 92
     available_height = max_text_bottom - text_top
     max_visible_lines = max(1, available_height // (body_line_height + LINE_SPACING))
     visible_lines = generated_lines[-max_visible_lines:]
@@ -139,10 +150,10 @@ def draw_panel(draw, box, trace, elapsed_s, title, accent, body_font, mono_font,
         draw.text((x0 + 20, cursor_y), line, fill=INK, font=body_font)
         cursor_y += body_line_height + LINE_SPACING
 
-    stats_y = y1 - 108
-    visible_tokens = count_visible_tokens(trace["events"], elapsed_s)
+    stats_y = y1 - 64
+    visible_tokens = count_visible_tokens(trace["events"], panel_elapsed)
     draw.text((x0 + 20, stats_y), f"Visible tokens: {visible_tokens}", fill=INK, font=mono_font)
-    status_counts = format_status_counts(trace["events"], elapsed_s)
+    status_counts = format_status_counts(trace["events"], panel_elapsed)
     if status_counts:
         status_parts = [f"{key}={value}" for key, value in status_counts.items()]
         draw.text((x0 + 20, stats_y + 28), " | ".join(status_parts), fill=MUTED, font=mono_font)
@@ -155,11 +166,11 @@ def render_frame(left_trace, right_trace, elapsed_s, output_path):
     body_font = load_font("sans", BODY_FONT_SIZE)
     mono_font = load_font("monospace", MONO_FONT_SIZE)
 
-    draw.text((PADDING, PADDING), "Token Timeline Comparison", fill=INK, font=title_font)
+    draw.text((PADDING, PADDING-10), "Token Timeline Comparison", fill=INK, font=title_font)
     subtitle = "Each token appears when it becomes part of the committed output sequence."
-    draw.text((PADDING, PADDING + HEADER_GAP), subtitle, fill=MUTED, font=mono_font)
+    draw.text((PADDING, PADDING + HEADER_GAP-7), subtitle, fill=MUTED, font=mono_font)
 
-    panel_top = PADDING + HEADER_GAP + 40
+    panel_top = PADDING + HEADER_GAP + 35
     panel_width = (WIDTH - (2 * PADDING) - PANEL_GAP) // 2
     left_box = (PADDING, panel_top, PADDING + panel_width, HEIGHT - PADDING)
     right_box = (PADDING + panel_width + PANEL_GAP, panel_top, WIDTH - PADDING, HEIGHT - PADDING)
