@@ -41,7 +41,6 @@ pip install -r requirements.txt
 - `scripts/` main implementation and benchmarking scripts
 - `notebooks/` Colab smoke-test notebook
 - `artifacts/` saved benchmark outputs, traces, and GIFs
-- `blog/` markdown write-up drafts
 
 ## Main Scripts
 
